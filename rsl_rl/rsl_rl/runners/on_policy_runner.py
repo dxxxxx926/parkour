@@ -35,6 +35,7 @@ import statistics
 
 from torch.utils.tensorboard import SummaryWriter
 import torch
+import wandb
 
 import rsl_rl.algorithms as algorithms
 import rsl_rl.modules as modules
@@ -84,12 +85,15 @@ class OnPolicyRunner:
         # initialize writer
         if self.log_dir is not None and self.writer is None:
             self.writer = SummaryWriter(log_dir=self.log_dir, flush_secs=10)
+
         if init_at_random_ep_len:
             self.env.episode_length_buf = torch.randint_like(self.env.episode_length_buf, high=int(self.env.max_episode_length))
+
         obs = self.env.get_observations()
         privileged_obs = self.env.get_privileged_observations()
         critic_obs = privileged_obs if privileged_obs is not None else obs
         obs, critic_obs = obs.to(self.device), critic_obs.to(self.device)
+
         self.alg.actor_critic.train() # switch to train mode (for dropout for example)
 
         ep_infos = []
@@ -101,6 +105,7 @@ class OnPolicyRunner:
 
         start_iter = self.current_learning_iteration
         tot_iter = self.current_learning_iteration + num_learning_iterations
+
         while self.current_learning_iteration < tot_iter:
             start = time.time()
             # Rollout
@@ -153,6 +158,7 @@ class OnPolicyRunner:
         self.tot_time += locs['collection_time'] + locs['learn_time']
         iteration_time = locs['collection_time'] + locs['learn_time']
 
+        wandb_dict = {}
         ep_string = f''
         if locs['ep_infos']:
             for key in locs['ep_infos'][0]:
@@ -166,14 +172,17 @@ class OnPolicyRunner:
                     infotensor = torch.cat((infotensor, ep_info[key].to(self.device)))
                 value = torch.mean(infotensor)
                 self.writer.add_scalar('Episode/' + key, value, self.current_learning_iteration)
+                wandb_dict['Episode/' + key] = value
                 ep_string += f"""{f'Mean episode {key}:':>{pad}} {value:.4f}\n"""
         mean_std = self.alg.actor_critic.action_std.mean()
         fps = int(self.num_steps_per_env * self.env.num_envs / (locs['collection_time'] + locs['learn_time']))
 
         for k, v in locs["losses"].items():
             self.writer.add_scalar("Loss/" + k, v.item(), self.current_learning_iteration)
+            wandb_dict["Loss/" + k] = v.item()
         for k, v in locs["stats"].items():
             self.writer.add_scalar("Train/" + k, v.item(), self.current_learning_iteration)
+            wandb_dict["Train/" + k] = v.item()
         
         self.writer.add_scalar('Loss/learning_rate', self.alg.learning_rate, self.current_learning_iteration)
         self.writer.add_scalar('Policy/mean_noise_std', mean_std.item(), self.current_learning_iteration)
@@ -183,11 +192,24 @@ class OnPolicyRunner:
         self.writer.add_scalar('Perf/gpu_allocated', torch.cuda.memory_allocated(self.device) / 1024 ** 3, self.current_learning_iteration)
         self.writer.add_scalar('Perf/gpu_occupied', torch.cuda.mem_get_info(self.device)[1] / 1024 ** 3, self.current_learning_iteration)
         self.writer.add_scalar('Train/mean_reward_each_timestep', statistics.mean(locs['rframebuffer']), self.current_learning_iteration)
+
+        wandb_dict['Loss/learning_rate'] = self.alg.learning_rate
+        wandb_dict['Policy/mean_noise_std'] = mean_std.item()
+        wandb_dict['Perf/total_fps'] = fps
+        wandb_dict['Perf/collection time'] = locs['collection_time']
+        wandb_dict['Perf/learning_time'] = locs['learn_time']
+        wandb_dict['Train/mean_reward_each_timestep'] = statistics.mean(locs['rframebuffer'])
+
         if len(locs['rewbuffer']) > 0:
             self.writer.add_scalar('Train/mean_reward', statistics.mean(locs['rewbuffer']), self.current_learning_iteration)
             self.writer.add_scalar('Train/mean_episode_length', statistics.mean(locs['lenbuffer']), self.current_learning_iteration)
             self.writer.add_scalar('Train/mean_reward/time', statistics.mean(locs['rewbuffer']), self.tot_time)
             self.writer.add_scalar('Train/mean_episode_length/time', statistics.mean(locs['lenbuffer']), self.tot_time)
+
+            wandb_dict['Train/mean_reward'] = statistics.mean(locs['rewbuffer'])
+            wandb_dict['Train/mean_episode_length'] = statistics.mean(locs['lenbuffer'])
+            # wandb_dict['Train/mean_reward/time'] = (statistics.mean(locs['rewbuffer']), self.tot_time)
+            # wandb_dict['Train/mean_episode_length/time'] = (statistics.mean(locs['lenbuffer']), self.tot_time)
 
         str = f" \033[1m Learning iteration {self.current_learning_iteration}/{locs['tot_iter']} \033[0m "
 
@@ -225,6 +247,8 @@ class OnPolicyRunner:
                                locs['tot_iter'] - self.current_learning_iteration):.1f}s\n""")
         print(log_string)
 
+        wandb.log(wandb_dict)
+
     def save(self, path, infos=None):
         run_state_dict = {
             'model_state_dict': self.alg.actor_critic.state_dict(),
@@ -235,6 +259,7 @@ class OnPolicyRunner:
         if hasattr(self.alg, "lr_scheduler"):
             run_state_dict["lr_scheduler_state_dict"] = self.alg.lr_scheduler.state_dict()
         torch.save(run_state_dict, path)
+
 
     def load(self, path, load_optimizer=True):
         loaded_dict = torch.load(path)

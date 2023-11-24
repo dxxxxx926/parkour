@@ -28,7 +28,8 @@ class TwoStageRunner(OnPolicyRunner):
                 for k, v in infos.items():
                     if not k in ["time_outs"]:
                         self.writer.add_scalar("Perf/dataset_" + k, v, self.current_learning_iteration)
-            if not transition is None:
+
+            if transition is not None:
                 self.alg.collect_transition_from_dataset(transition, infos)
                 return (
                     transition.observation,
